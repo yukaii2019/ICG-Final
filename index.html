@@ -771,7 +771,7 @@
 	            gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 	            gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGB,
                                 gSceneParams['atlas_width'], gSceneParams['atlas_height'], gSceneParams['atlas_depth'], 
-                                0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array(3 * gSceneParams['atlas_width'] * gSceneParams['atlas_height'] * gSceneParams['atlas_depth']).fill(10));
+                                0, gl.RGB, gl.UNSIGNED_BYTE, null);
 	            gl.bindTexture(gl.TEXTURE_3D, null);
 
                 alphaVolumeTexture = gl.createTexture();
@@ -783,7 +783,7 @@
                 gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_NEAREST);
                 gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8,
                                 gSceneParams['atlas_width'], gSceneParams['atlas_height'], gSceneParams['atlas_depth'],
-                                0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(gSceneParams['atlas_width'] * gSceneParams['atlas_height'] * gSceneParams['atlas_depth']).fill(100));
+                                0, gl.RED, gl.UNSIGNED_BYTE, null);
                 gl.generateMipmap(gl.TEXTURE_3D);
                 gl.bindTexture(gl.TEXTURE_3D, null);      
 
@@ -797,7 +797,7 @@
                     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
                     gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA,
                                     gSceneParams['atlas_width'], gSceneParams['atlas_height'], gSceneParams['atlas_depth'],
-                                    0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4 * gSceneParams['atlas_width'] * gSceneParams['atlas_height'] * gSceneParams['atlas_depth']).fill(11));
+                                    0, gl.RGBA, gl.UNSIGNED_BYTE, null);
                     gl.bindTexture(gl.TEXTURE_3D, null);
                 }
 
