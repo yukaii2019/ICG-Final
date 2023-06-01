@@ -1,0 +1,1083 @@
+<html>
+
+<head>
+    <title>ICG Final Project Snerg </title>
+    <meta http-equiv="content-type" content="text/html; charset=ISO-8859-1">
+    <script type="text/javascript" src="./glMatrix-0.9.5.min.js"></script>
+    <script type="text/javascript" src="./webgl-utils.js"></script>
+    <script src="https://unpkg.com/png-js@1.0.0/zlib.js"></script>
+    <script src="https://unpkg.com/png-js@1.0.0/png.js"></script>
+
+    <link rel="stylesheet" type="text/css" href="./css_style.css">
+
+    <script id="vertexShader" type="x-shader/x-vertex">#version 300 es
+        in vec3 aVertexPosition;
+        uniform mat4 uvMatrix;
+        uniform mat4 upMatrix;
+        uniform mat4 world_T_clip;
+        out vec3 vOrigin;
+        out vec3 vDirection;
+        void main()
+        {
+            vec4 positionClip = upMatrix * uvMatrix * vec4(aVertexPosition, 1.0); 
+            gl_Position = positionClip;
+
+            positionClip /= positionClip.w;
+            vec4 nearPoint = world_T_clip * vec4(positionClip.x, positionClip.y, -1.0, 1.0);
+            vec4 farPoint = world_T_clip * vec4(positionClip.x, positionClip.y, 1.0, 1.0);
+
+            vOrigin = nearPoint.xyz / nearPoint.w;
+            vDirection = normalize(farPoint.xyz / farPoint.w - vOrigin);
+        }
+    </script>
+    
+    <script id="fragmentShader" type="x-shader/x-fragment"> #version 300 es 
+        precision lowp float;
+
+        in vec3 vOrigin;
+        in vec3 vDirection; 
+
+        uniform int displayMode;
+        uniform int ndc;
+
+        uniform vec3 minPosition;
+        uniform vec3 gridSize;
+        uniform vec3 atlasSize;
+        uniform float voxelSize;
+        uniform float blockSize;
+        uniform mat3 worldspace_R_opengl;
+        uniform float nearPlane;
+
+        uniform float ndc_h;
+        uniform float ndc_w;
+        uniform float ndc_f;
+
+        uniform lowp sampler3D mapAlpha;
+        uniform lowp sampler3D mapColor;
+        uniform lowp sampler3D mapFeatures;
+        uniform mediump sampler3D mapIndex;
+
+        uniform mediump sampler2D weightsZero;
+        uniform mediump sampler2D weightsOne;
+        uniform mediump sampler2D weightsTwo;
+
+        out vec4 fragColor;
+
+        mediump float indexToPosEnc(vec3 dir, int index) {
+            mediump float coordinate =
+                (index % 3 == 0) ? dir.x : (
+                (index % 3 == 1) ? dir.y : dir.z);
+            if (index < 3) {
+                return coordinate;
+            }
+            int scaleExponent = ((index - 3) % (3 * 4)) / 3;
+            coordinate *= pow(2.0, float(scaleExponent));
+            if ((index - 3) >= 3 * 4) {
+                const float kHalfPi = 1.57079632679489661923;
+                coordinate += kHalfPi;
+            }
+            return sin(coordinate);
+        }
+
+        mediump vec3 evaluateNetwork(lowp vec3 color, lowp vec4 features, mediump vec3 viewdir) {
+            mediump float intermediate_one[NUM_CHANNELS_ONE] = float[](
+                BIAS_LIST_ZERO
+            );
+            for (int j = 0; j < NUM_CHANNELS_ZERO; ++j){
+                mediump float input_value = 0.0;
+                if (j < 27) {
+                    input_value = indexToPosEnc(viewdir, j);
+                } 
+                else if (j < 30) {
+                    input_value = (j % 3 == 0) ? color.r : ((j % 3 == 1) ? color.g : color.b);
+                } 
+                else {
+                    input_value = (j == 30) ? features.r : ((j == 31) ? features.g : ((j == 32) ? features.b : features.a));
+                }
+                if (abs(input_value) < 0.1 / 255.0) {
+                    continue;
+                }
+                for (int i = 0; i < NUM_CHANNELS_ONE; ++i) {
+                    intermediate_one[i] += input_value * texelFetch(weightsZero, ivec2(j, i), 0).x;
+                }
+            }
+        
+            mediump float intermediate_two[NUM_CHANNELS_TWO] = float[](
+                BIAS_LIST_ONE
+            );
+            for (int j = 0; j < NUM_CHANNELS_ONE; ++j) {
+                if (intermediate_one[j] <= 0.0) {
+                    continue;
+                }
+                for (int i = 0; i < NUM_CHANNELS_TWO; ++i) {
+                    intermediate_two[i] += intermediate_one[j] * texelFetch(weightsOne, ivec2(j, i), 0).x;
+                }
+            }
+        
+            mediump float result[NUM_CHANNELS_THREE] = float[](
+                BIAS_LIST_TWO
+            );
+            for (int j = 0; j < NUM_CHANNELS_TWO; ++j) {
+                if (intermediate_two[j] <= 0.0) {
+                    continue;
+                }
+                for (int i = 0; i < NUM_CHANNELS_THREE; ++i) {
+                    result[i] += intermediate_two[j] * texelFetch(weightsTwo, ivec2(j, i), 0).x;
+                }
+            }
+            for (int i = 0; i < NUM_CHANNELS_THREE; ++i) {
+                result[i] = 1.0 / (1.0 + exp(-result[i]));
+            }
+            return vec3(result[0], result[1], result[2]);
+        }
+
+        mediump vec3 convertOriginToNDC(vec3 origin, vec3 direction) {
+            // We store the NDC scenes flipped, so flip back.
+            origin.z *= -1.0;
+            direction.z *= -1.0;
+        
+            const float near = 1.0;
+            float t = -(near + origin.z) / direction.z;
+            origin = origin * t + direction;
+        
+            // Hardcoded, worked out using approximate iPhone FOV of 67.3 degrees
+            // and an image width of 1006 px.
+            float focal = ndc_f;
+            float W = ndc_w;
+            float H = ndc_h;
+            float o0 = 1.0 / (W / (2.0 * focal)) * origin.x / origin.z;
+            float o1 = -1.0 / (H / (2.0 * focal)) * origin.y / origin.z;
+            float o2 = 1.0 + 2.0 * near / origin.z;
+        
+            origin = vec3(o0, o1, o2);
+            origin.z *= -1.0;
+            return origin;
+        }
+        mediump vec3 convertDirectionToNDC(vec3 origin, vec3 direction) {
+            // We store the NDC scenes flipped, so flip back.
+            origin.z *= -1.0;
+            direction.z *= -1.0;
+        
+            const float near = 1.0;
+            float t = -(near + origin.z) / direction.z;
+            origin = origin * t + direction;
+        
+            // Hardcoded, worked out using approximate iPhone FOV of 67.3 degrees
+            // and an image width of 1006 px.
+            float focal = ndc_f;
+            float W = ndc_w;
+            float H = ndc_h;
+        
+            float d0 = 1.0 / (W / (2.0 * focal)) *
+              (direction.x / direction.z - origin.x / origin.z);
+            float d1 = -1.0 / (H / (2.0 * focal)) *
+              (direction.y / direction.z - origin.y / origin.z);
+            float d2 = -2.0 * near / origin.z;
+        
+            direction = normalize(vec3(d0, d1, d2));
+            direction.z *= -1.0;
+            return direction;
+        }
+        mediump vec3 pancakeBlockIndex(mediump vec3 posGrid, float blockSize, ivec3 iBlockGridBlocks) {
+            ivec3 iBlockIndex = ivec3(floor(posGrid / blockSize));
+            ivec3 iAtlasBlocks = ivec3(atlasSize) / ivec3(blockSize + 2.0);
+            int linearIndex = iBlockIndex.x + iBlockGridBlocks.x * (iBlockIndex.z + iBlockGridBlocks.z * iBlockIndex.y);
+            
+            mediump vec3 atlasBlockIndex = vec3(
+                float(linearIndex % iAtlasBlocks.x),
+                float((linearIndex / iAtlasBlocks.x) % iAtlasBlocks.y),
+                float(linearIndex / (iAtlasBlocks.x * iAtlasBlocks.y)));
+            
+            // If we exceed the size of the atlas, indicate an empty voxel block.
+            if (atlasBlockIndex.z >= float(iAtlasBlocks.z)) {
+                atlasBlockIndex = vec3(-1.0, -1.0, -1.0);
+            }
+            return atlasBlockIndex;
+        }
+
+        mediump vec2 rayAabbIntersection(mediump vec3 aabbMin, mediump vec3 aabbMax, mediump vec3 origin, mediump vec3 invDirection) {
+            mediump vec3 t1 = (aabbMin - origin) * invDirection;
+            mediump vec3 t2 = (aabbMax - origin) * invDirection;
+            mediump vec3 tMin = min(t1, t2);
+            mediump vec3 tMax = max(t1, t2);
+            return vec2(max(tMin.x, max(tMin.y, tMin.z)), min(tMax.x, min(tMax.y, tMax.z)));
+        }
+        void main()
+        {
+            // See the DisplayMode enum at the top of this file.
+            // Runs the full model with view dependence.
+            const int DISPLAY_NORMAL = 0;
+            // Disables the view-dependence network.
+            const int DISPLAY_DIFFUSE = 1;
+            // Only shows the latent features.
+            const int DISPLAY_FEATURES = 2;
+            // Only shows the view dependent component.
+            const int DISPLAY_VIEW_DEPENDENT = 3;
+            // Only shows the coarse block grid.
+            const int DISPLAY_COARSE_GRID = 4;
+            // Only shows the 3D texture atlas.
+            const int DISPLAY_3D_ATLAS = 5;
+        
+            // Set up the ray parameters in world space.
+            float nearWorld = nearPlane;
+            mediump vec3 originWorld = vOrigin;
+            mediump vec3 directionWorld = normalize(vDirection);
+            if (ndc != 0) {
+                nearWorld = 0.0;
+                originWorld = convertOriginToNDC(vOrigin, normalize(vDirection));
+                directionWorld = convertDirectionToNDC(vOrigin, normalize(vDirection));
+            }
+
+            // Now transform them to the voxel grid coordinate system.
+            mediump vec3 originGrid = (originWorld - minPosition) / voxelSize;
+            mediump vec3 directionGrid = directionWorld;
+            mediump vec3 invDirectionGrid = 1.0 / directionGrid;
+        
+            ivec3 iGridSize = ivec3(round(gridSize));
+            int iBlockSize = int(round(blockSize));
+            ivec3 iBlockGridBlocks = (iGridSize + iBlockSize - 1) / iBlockSize;
+            ivec3 iBlockGridSize = iBlockGridBlocks * iBlockSize;
+            mediump vec3 blockGridSize = vec3(iBlockGridSize);
+            mediump vec2 tMinMax = rayAabbIntersection(
+              vec3(0.0, 0.0, 0.0), gridSize, originGrid, invDirectionGrid);
+        
+            // Skip any rays that miss the scene bounding box.
+            fragColor = vec4(1.0, 1.0, 1.0, 1.0);
+            if (tMinMax.x > tMinMax.y) {
+              return;
+            }
+
+            mediump float t = max(nearWorld / voxelSize, tMinMax.x) + 0.5;
+            mediump vec3 posGrid = originGrid + directionGrid * t;
+        
+            mediump vec3 blockMin = floor(posGrid / blockSize) * blockSize;
+            mediump vec3 blockMax = blockMin + blockSize;
+            mediump vec2 tBlockMinMax = rayAabbIntersection(
+                  blockMin, blockMax, originGrid, invDirectionGrid);
+            mediump vec3 atlasBlockIndex;
+
+            if (displayMode == DISPLAY_3D_ATLAS) {
+                atlasBlockIndex = pancakeBlockIndex(posGrid, blockSize, iBlockGridBlocks);
+            } 
+            else {
+                atlasBlockIndex = 255.0 * texture(mapIndex, (blockMin + blockMax) / (2.0 * blockGridSize)).xyz;
+            }
+          
+            lowp float visibility = 1.0;
+            lowp vec3 color = vec3(0.0, 0.0, 0.0);
+            lowp vec4 features = vec4(0.0, 0.0, 0.0, 0.0);
+            int step = 0;
+            int maxStep = int(ceil(length(gridSize)));
+
+            while (step < maxStep && t < tMinMax.y && visibility > 1.0 / 255.0) {
+                // Skip empty macroblocks.
+                if (atlasBlockIndex.x > 254.0) {
+                    t = 0.5 + tBlockMinMax.y;
+                } 
+                else { // Otherwise step through them and fetch RGBA and Features.
+                    mediump vec3 posAtlas = clamp(posGrid - blockMin, 0.0, blockSize);
+                    posAtlas += atlasBlockIndex * (blockSize + 2.0);
+                    posAtlas += 1.0; // Account for the one voxel padding in the atlas.
+              
+                    if (displayMode == DISPLAY_COARSE_GRID) {
+                        color = atlasBlockIndex * (blockSize + 2.0) / atlasSize;
+                        features.rgb = atlasBlockIndex * (blockSize + 2.0) / atlasSize;
+                        features.a = 1.0;
+                        visibility = 0.0;
+                        continue;
+                    }
+                    // Do a conservative fetch for alpha!=0 at a lower resolution,
+                    // and skip any voxels which are empty. First, this saves bandwidth
+                    // since we only fetch one byte instead of 8 (trilinear) and most
+                    // fetches hit cache due to low res. Second, this is conservative,
+                    // and accounts for any possible alpha mass that the high resolution
+                    // trilinear would find.
+                    const int skipMipLevel = 2;
+                    const float miniBlockSize = float(1 << skipMipLevel);
+                    
+                    // Only fetch one byte at first, to conserve memory bandwidth in
+                    // empty space.
+                    lowp float atlasAlpha = texelFetch(mapAlpha, ivec3(posAtlas / miniBlockSize), skipMipLevel).x;
+                    
+                    if (atlasAlpha > 0.0) {
+                        // OK, we hit something, do a proper trilinear fetch at high res.
+                        mediump vec3 atlasUvw = posAtlas / atlasSize;
+                        atlasAlpha = textureLod(mapAlpha, atlasUvw, 0.0).x;
+                    
+                        // Only worth fetching the content if high res alpha is non-zero.
+                        if (atlasAlpha > 0.5 / 255.0) {
+                            lowp vec4 atlasRgba = vec4(0.0, 0.0, 0.0, atlasAlpha);
+                            atlasRgba.rgb = texture(mapColor, atlasUvw).rgb;
+                            if (displayMode != DISPLAY_DIFFUSE) {
+                                lowp vec4 atlasFeatures = texture(mapFeatures, atlasUvw);
+                                features += visibility * atlasFeatures;
+                            }
+                            color += visibility * atlasRgba.rgb;
+                            visibility *= 1.0 - atlasRgba.a;
+                        }
+                    }
+                    t += 1.0;
+                }
+            
+                posGrid = originGrid + directionGrid * t;
+                if (t > tBlockMinMax.y) {
+                    blockMin = floor(posGrid / blockSize) * blockSize;
+                    blockMax = blockMin + blockSize;
+                    tBlockMinMax = rayAabbIntersection(blockMin, blockMax, originGrid, invDirectionGrid);
+              
+                    if (displayMode == DISPLAY_3D_ATLAS) {
+                        atlasBlockIndex = pancakeBlockIndex(
+                        posGrid, blockSize, iBlockGridBlocks);
+                    } 
+                    else {
+                        atlasBlockIndex = 255.0 * texture(
+                        mapIndex, (blockMin + blockMax) / (2.0 * blockGridSize)).xyz;
+                    }
+                }
+                step++;
+            }
+
+            if (displayMode == DISPLAY_VIEW_DEPENDENT) {
+                color = vec3(0.0, 0.0, 0.0) * visibility;
+            } 
+            else if (displayMode == DISPLAY_FEATURES) {
+                color = features.rgb;
+            }
+          
+            // Compute the final color, to save compute only compute view-depdence
+            // for rays that intersected something in the scene.
+            color = vec3(1.0, 1.0, 1.0) * visibility + color;
+            const float kVisibilityThreshold = 254.0 / 255.0;
+            if (visibility <= kVisibilityThreshold && (displayMode == DISPLAY_NORMAL || displayMode == DISPLAY_VIEW_DEPENDENT)) {
+                color += evaluateNetwork(color, features, worldspace_R_opengl * normalize(vDirection));
+            }
+            fragColor = vec4(color, 1.0);
+            //fragColor = vec4(0.5, 0.5, 0.5, 1.0);
+        }
+    </script>
+
+
+    <script type="text/javascript">
+        // common variables
+        var gl;
+        var shaderProgram;
+        
+        // plane attribute buffers
+        var VertexPositionBuffer;
+        var VertexIndiceBuffer;
+
+        // 3d textures
+        var alphaVolumeTexture=null;
+        var rgbVolumeTexture=null;
+        var featureVolumeTexture=null;
+        var atlasIndexTexture=null;
+
+        // 2d textures
+        var weightsZero=null;
+        var weightsOne=null;
+        var weightsTwo=null;
+
+        // scene parameters
+        var gSceneParams = null
+
+
+        var gCamera_Inv_projectionMatrix = mat4.create();
+        var gCamera_Inv_matrixWorld = mat4.create();
+
+        var vMatrix = mat4.create();
+        var pMatrix = mat4.create();
+
+        var world_T_clip = mat4.create(); 
+        // display mode
+        var DisplayMode = 0;
+
+        // initial camera transformation
+        var xRotation = 0;
+        var yRotation = 0;
+        var camz;
+        
+
+        function initGL(canvas) {
+            try {
+                //gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+                gl = canvas.getContext("webgl2");
+                gl.getExtension('OES_standard_derivatives');
+                gl.viewportWidth = canvas.width;
+                gl.viewportHeight = canvas.height;
+            }
+            catch (e) {
+            }
+            if (!gl) {
+                alert("Could not initialise WebGL, sorry :-(");
+            }
+        }
+
+        function createViewDependenceFunctions(frag_shader, scene_params) {
+            let network_weights = scene_params;
+            let width = network_weights['0_bias'].length;
+            console.log(width)
+            let biasListZero = '';
+            for (let i = 0; i < width; i++) {
+                let bias = network_weights['0_bias'][i];
+                biasListZero += Number(bias).toFixed(7);
+                if (i + 1 < width) {
+                    biasListZero += ', ';
+                }
+            }
+      
+            width = network_weights['1_bias'].length;
+            let biasListOne = '';
+            for (let i = 0; i < width; i++) {
+                let bias = network_weights['1_bias'][i];
+                biasListOne += Number(bias).toFixed(7);
+                if (i + 1 < width) {
+                    biasListOne += ', ';
+                }
+            }
+      
+            width = network_weights['2_bias'].length;
+            let biasListTwo = '';
+            for (let i = 0; i < width; i++) {
+                let bias = network_weights['2_bias'][i];
+                biasListTwo += Number(bias).toFixed(7);
+                if (i + 1 < width) {
+                    biasListTwo += ', ';
+                }
+            }
+      
+            let channelsZero = network_weights['0_weights'].length;
+            let channelsOne = network_weights['0_bias'].length;
+            let channelsTwo = network_weights['1_bias'].length;
+            let channelsThree = network_weights['2_bias'].length;
+            let posEncScales = 4;
+            
+            let fragmentShaderSource = frag_shader.replace(
+                new RegExp('NUM_CHANNELS_ZERO', 'g'), channelsZero);
+            fragmentShaderSource = fragmentShaderSource.replace(
+                new RegExp('NUM_POSENC_SCALES', 'g'), posEncScales.toString());
+            fragmentShaderSource = fragmentShaderSource.replace(
+                new RegExp('NUM_CHANNELS_ONE', 'g'), channelsOne);
+            fragmentShaderSource = fragmentShaderSource.replace(
+                new RegExp('NUM_CHANNELS_TWO', 'g'), channelsTwo);
+            fragmentShaderSource = fragmentShaderSource.replace(
+                new RegExp('NUM_CHANNELS_THREE', 'g'), channelsThree);
+            
+            fragmentShaderSource = fragmentShaderSource.replace(
+                new RegExp('BIAS_LIST_ZERO', 'g'), biasListZero);
+            fragmentShaderSource = fragmentShaderSource.replace(
+                new RegExp('BIAS_LIST_ONE', 'g'), biasListOne);
+              fragmentShaderSource = fragmentShaderSource.replace(
+                new RegExp('BIAS_LIST_TWO', 'g'), biasListTwo);
+            
+            return fragmentShaderSource;
+        }
+
+        function getShader(gl, id) {
+            var shaderScript = document.getElementById(id);
+            if (!shaderScript) {
+                return null;
+            }
+
+            var shaderSource = "";
+            var k = shaderScript.firstChild;
+            while (k) {
+                if (k.nodeType == 3) {
+                    shaderSource += k.textContent;
+                }
+
+                k = k.nextSibling;
+            }
+            var shader;
+            if (shaderScript.type == "x-shader/x-fragment") {
+                shader = gl.createShader(gl.FRAGMENT_SHADER);
+                shaderSource = createViewDependenceFunctions(shaderSource, gSceneParams)
+            }
+            else if (shaderScript.type == "x-shader/x-vertex") {
+                shader = gl.createShader(gl.VERTEX_SHADER);
+            }
+            else {
+                return null;
+            }
+
+            gl.shaderSource(shader, shaderSource);
+            gl.compileShader(shader);
+
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                alert(gl.getShaderInfoLog(shader));
+                return null;
+            }
+            return shader;
+        }
+
+        function initShaders() {
+            let fragmentShader = getShader(gl, "fragmentShader");
+            let vertexShader = getShader(gl, "vertexShader");
+            shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, fragmentShader);
+            gl.attachShader(shaderProgram, vertexShader);
+            gl.linkProgram(shaderProgram);
+            if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+                alert("Could not initialise shaders");
+            }
+            shaderProgram.vertexPositionAttribute = gl.getAttribLocation(shaderProgram, "aVertexPosition");
+            shaderProgram.vMatrixUniform = gl.getUniformLocation(shaderProgram, "uvMatrix");
+            shaderProgram.pMatrixUniform = gl.getUniformLocation(shaderProgram, "upMatrix");
+            shaderProgram.world_T_clipUniform = gl.getUniformLocation(shaderProgram, "world_T_clip"); 
+            shaderProgram.displayModeUniform = gl.getUniformLocation(shaderProgram, "displayMode"); 
+            shaderProgram.ndcUniform = gl.getUniformLocation(shaderProgram, "ndc"); 
+            shaderProgram.minPositionUniform = gl.getUniformLocation(shaderProgram, "minPosition"); 
+            shaderProgram.gridSizeUniform = gl.getUniformLocation(shaderProgram, "gridSize"); 
+            shaderProgram.atlasSizeUniform = gl.getUniformLocation(shaderProgram, "atlasSize"); 
+            shaderProgram.voxelSizeUniform = gl.getUniformLocation(shaderProgram, "voxelSize"); 
+            shaderProgram.blockSizeUniform = gl.getUniformLocation(shaderProgram, "blockSize"); 
+            shaderProgram.worldspace_R_openglUniform = gl.getUniformLocation(shaderProgram, "worldspace_R_opengl"); 
+            shaderProgram.nearPlaneUniform = gl.getUniformLocation(shaderProgram, "nearPlane"); 
+            shaderProgram.ndc_hUniform = gl.getUniformLocation(shaderProgram, "ndc_h"); 
+            shaderProgram.ndc_wUniform = gl.getUniformLocation(shaderProgram, "ndc_w"); 
+            shaderProgram.ndc_fUniform = gl.getUniformLocation(shaderProgram, "ndc_f"); 
+            gl.useProgram(shaderProgram);
+            shaderProgram.mapAlphaUniform = gl.getUniformLocation(shaderProgram, "mapAlpha"); 
+            gl.uniform1i(shaderProgram.mapAlphaUniform, 0);
+            shaderProgram.mapColorUniform = gl.getUniformLocation(shaderProgram, "mapColor"); 
+            gl.uniform1i(shaderProgram.mapColorUniform, 1);
+            shaderProgram.mapFeaturesUniform = gl.getUniformLocation(shaderProgram, "mapFeatures"); 
+            gl.uniform1i(shaderProgram.mapFeaturesUniform, 2);
+            shaderProgram.mapIndexUniform = gl.getUniformLocation(shaderProgram, "mapIndex"); 
+            gl.uniform1i(shaderProgram.mapIndexUniform, 3);
+            shaderProgram.weightsZeroUniform = gl.getUniformLocation(shaderProgram, "weightsZero"); 
+            gl.uniform1i(shaderProgram.weightsZeroUniform, 4);
+            shaderProgram.weightsOneUniform = gl.getUniformLocation(shaderProgram, "weightsOne"); 
+            gl.uniform1i(shaderProgram.weightsOneUniform, 5);
+            shaderProgram.weightsTwoUniform = gl.getUniformLocation(shaderProgram, "weightsTwo"); 
+            gl.uniform1i(shaderProgram.weightsTwoUniform, 6);
+        }
+
+        function loadPNG(rgbaUrl) {
+            const rgbaPromise = fetch(rgbaUrl, {
+                                  method: 'GET',
+                                  mode: 'same-origin',
+                                }).then(response => {
+                return response.arrayBuffer();
+            }).then(buffer => {
+                let data = new Uint8Array(buffer);
+                let pngDecoder = new PNG(data);
+                let pixels = pngDecoder.decodePixels();
+                return pixels;
+            });
+            rgbaPromise.catch(error => {
+                console.error('Could not PNG image from: ' + rgbaUrl + ', error: ' + error);
+                return;
+            });
+            return rgbaPromise;
+        }
+
+        function digits(i, min) {
+            const s = '' + i;
+            if (s.length >= min) {
+                return s;
+            } 
+            else {
+                return ('00000' + s).substr(-min);
+            }
+        }
+
+        function loadSplitVolumeTexturePNG(url, num_slices, volume_width, volume_height, volume_depth, on_update) {
+            const slice_depth = 4;
+            let uploadPromises = [];
+        
+            for (let i = 0; i < num_slices; i++) {
+                let rgbaUrl = url + '_' + digits(i, 3) + '.png';
+                let rgbaPromise = loadPNG(rgbaUrl);
+                rgbaPromise = rgbaPromise.then(data => {
+                    on_update();
+                    return data;
+                });
+            
+                uploadPromises[i] = new Promise(function(resolve, reject) {
+                    Promise.all([rgbaPromise, i]).then(values => {
+                        let rgbaPixels = values[0];
+                        let i = values[1];
+                    
+                        let rgbPixels = new Uint8Array(volume_width * volume_height * slice_depth * 3);
+                        let alphaPixels = new Uint8Array(volume_width * volume_height * slice_depth * 1);
+                    
+                        for (let j = 0; j < volume_width * volume_height * slice_depth;j++) {
+                            rgbPixels[j * 3 + 0] = rgbaPixels[j * 4 + 0];
+                            rgbPixels[j * 3 + 1] = rgbaPixels[j * 4 + 1];
+                            rgbPixels[j * 3 + 2] = rgbaPixels[j * 4 + 2];
+                            alphaPixels[j] = rgbaPixels[j * 4 + 3];
+                        }
+
+                        let oldTexture = gl.getParameter(gl.TEXTURE_BINDING_3D);
+
+                        gl.bindTexture(gl.TEXTURE_3D, rgbVolumeTexture);
+                        for (let z = 0; z < slice_depth; ++z) {
+                            for (let y = 0; y < volume_height; ++y) {
+                            gl.texSubImage3D(
+                                gl.TEXTURE_3D, 0, 0, y, z + i * slice_depth,
+                                volume_width, 1, 1, gl.RGB, gl.UNSIGNED_BYTE,
+                                rgbPixels, 3 * volume_width * (y + volume_height * z));
+                            }
+                        }
+                    
+                        gl.bindTexture(gl.TEXTURE_3D, alphaVolumeTexture);
+                        for (let z = 0; z < slice_depth; ++z) {
+                            for (let y = 0; y < volume_height; ++y) {
+                            gl.texSubImage3D(
+                                gl.TEXTURE_3D, 0, 0, y, z + i * slice_depth,
+                                volume_width, 1, 1, gl.RED, gl.UNSIGNED_BYTE,
+                                alphaPixels, volume_width * (y + volume_height * z));
+                            }
+                        }
+                        gl.bindTexture(gl.TEXTURE_3D, oldTexture); 
+                        resolve();
+                    
+                    }).catch(error => {reject(error);
+                  });
+                });
+            }
+            return new Promise(function(resolve, reject) {
+                Promise.all(uploadPromises).then(values => {
+                resolve(values[0]);
+                });
+            });
+        }
+
+        function loadVolumeTexturePNG(url, num_slices, volume_width, volume_height, volume_depth, on_update) {
+            const slice_depth = 4;
+            let uploadPromises = [];
+            for (let i = 0; i < num_slices; i++) {
+                let rgbaUrl = url + '_' + digits(i, 3) + '.png';
+                let rgbaPromise = loadPNG(rgbaUrl);
+                rgbaPromise = rgbaPromise.then(data => {
+                    on_update();
+                    return data;
+                });
+
+                uploadPromises[i] = new Promise(function(resolve, reject) {
+                    Promise.all([rgbaPromise, i]).then(values => {
+                        let rgbaImage = values[0];
+                        let i = values[1];
+
+                        let oldTexture = gl.getParameter(gl.TEXTURE_BINDING_3D);
+
+                        gl.bindTexture(gl.TEXTURE_3D, featureVolumeTexture);
+                        for (let z = 0; z < slice_depth; ++z) {
+                            for (let y = 0; y < volume_height; ++y) {
+                            gl.texSubImage3D(
+                                gl.TEXTURE_3D, 0, 0, y, z + i * slice_depth,
+                                volume_width, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE,
+                                rgbaImage, 4 * volume_width * (y + volume_height * z));
+                            }
+                        }
+                        gl.bindTexture(gl.TEXTURE_3D, oldTexture);
+                        resolve();
+                    })
+                    .catch(error => {
+                            reject(error);
+                    });
+                });
+            }
+
+            return new Promise(function(resolve, reject) {
+                Promise.all(uploadPromises).then(values => {
+                    resolve(values[0]);
+                });
+            });
+        }        
+
+        function createFloatTextureFromData(width, height, data) {
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            // Set texture parameters
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+
+            // Specify the texture data
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0,  gl.RED, gl.FLOAT, data);
+
+            // Unbind the texture
+            gl.bindTexture(gl.TEXTURE_2D, null);
+            return texture;
+        }
+
+        function createNetworkWeightTexture(network_weights) {
+            if (!network_weights) {
+                let weightsData = new Float32Array([0]);
+                return createFloatTextureFromData(1, 1, weightsData);
+            }
+            let width = network_weights.length;
+            let height = network_weights[0].length;
+
+            let weightsData = new Float32Array(width * height);
+            for (let co = 0; co < height; co++) {
+                for (let ci = 0; ci < width; ci++) {
+                    let index = co * width + ci;
+                    let weight = network_weights[ci][co];
+                    weightsData[index] = weight;
+                }
+            }
+            return createFloatTextureFromData(width, height, weightsData);
+        }
+
+
+        function loadScene(sceneDir){
+            let sceneParamsUrl = sceneDir + '/' + 'scene_params.json';
+            let sceneParamsPromise = fetch(sceneParamsUrl, {method: 'GET',mode: 'same-origin'}).then(
+                response => {return response.json();}
+            );
+            sceneParamsPromise.catch(error => {console.error(
+                'Could not load scene params from: ' + sceneParamsUrl + ', error: ' + error);
+                return;}
+            );
+
+            const imageLoader = new Image();
+            const atlasIndexUrl = sceneDir + '/' + 'atlas_indices.png';
+            const atlasIndexPromise = new Promise((resolve, reject) => {
+                imageLoader.onload = () => {
+                    resolve(imageLoader);
+                };
+                imageLoader.onerror = () => {
+                    reject(atlasIndexUrl);
+                };
+                imageLoader.crossOrigin = "anonymous"
+                imageLoader.src = atlasIndexUrl;
+            });
+
+            let initializedPromise = Promise.all([sceneParamsPromise, atlasIndexPromise]);
+
+            initializedPromise.then(values => {
+                canvas = document.getElementById("ICG-canvas");
+                initGL(canvas); 
+                
+                let parsed = values[0];
+                let atlasIndexImage = values[1];
+
+                gSceneParams = parsed;
+                gSceneParams['dirUrl'] = sceneDir;
+                gSceneParams['diffuse'] = true;
+                // If we have a view-dependence network in the json file, turn on view dependence.
+                if ('0_bias' in gSceneParams) {
+                    gSceneParams['diffuse'] = false;
+                }
+
+                rgbVolumeTexture = gl.createTexture();
+                gl.bindTexture  (gl.TEXTURE_3D, rgbVolumeTexture);
+	            gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+	            gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+	            gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+	            gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+	            gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGB,
+                                gSceneParams['atlas_width'], gSceneParams['atlas_height'], gSceneParams['atlas_depth'], 
+                                0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array(3 * gSceneParams['atlas_width'] * gSceneParams['atlas_height'] * gSceneParams['atlas_depth']).fill(10));
+	            gl.bindTexture(gl.TEXTURE_3D, null);
+
+                alphaVolumeTexture = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_3D, alphaVolumeTexture);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_NEAREST);
+                gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8,
+                                gSceneParams['atlas_width'], gSceneParams['atlas_height'], gSceneParams['atlas_depth'],
+                                0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(gSceneParams['atlas_width'] * gSceneParams['atlas_height'] * gSceneParams['atlas_depth']).fill(100));
+                gl.generateMipmap(gl.TEXTURE_3D);
+                gl.bindTexture(gl.TEXTURE_3D, null);      
+
+                if (!gSceneParams['diffuse']) {
+                    featureVolumeTexture = gl.createTexture();
+                    gl.bindTexture(gl.TEXTURE_3D, featureVolumeTexture);
+                    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+                    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA,
+                                    gSceneParams['atlas_width'], gSceneParams['atlas_height'], gSceneParams['atlas_depth'],
+                                    0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4 * gSceneParams['atlas_width'] * gSceneParams['atlas_height'] * gSceneParams['atlas_depth']).fill(11));
+                    gl.bindTexture(gl.TEXTURE_3D, null);
+                }
+
+                atlasIndexTexture = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_3D, atlasIndexTexture);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA,
+                                Math.ceil(gSceneParams['grid_width'] / gSceneParams['block_size']),
+                                Math.ceil(gSceneParams['grid_height'] / gSceneParams['block_size']),
+                                Math.ceil(gSceneParams['grid_depth'] / gSceneParams['block_size']),
+                                0, gl.RGBA, gl.UNSIGNED_BYTE, atlasIndexImage);
+                gl.bindTexture(gl.TEXTURE_3D, null);
+                
+                let rgbVolumeTexturePromise = loadSplitVolumeTexturePNG(
+                        gSceneParams['dirUrl'] + '/rgba', gSceneParams['num_slices'], 
+                        gSceneParams['atlas_width'], gSceneParams['atlas_height'],
+                        gSceneParams['atlas_depth'], function() {});
+                
+                let featureVolumeTexturePromise = null;
+                if (!gSceneParams['diffuse']) {
+                    featureVolumeTexturePromise = loadVolumeTexturePNG(
+                        gSceneParams['dirUrl'] + '/feature', gSceneParams['num_slices'],
+                        gSceneParams['atlas_width'], gSceneParams['atlas_height'],
+                        gSceneParams['atlas_depth'], function() {});
+                }
+                
+                let weightTexturePromise = new Promise((resolve, reject) => {
+                    if (!gSceneParams['diffuse']) {
+                        weightsZero = createNetworkWeightTexture(gSceneParams['0_weights']);
+                        weightsOne = createNetworkWeightTexture(gSceneParams['1_weights']);
+                        weightsTwo = createNetworkWeightTexture(gSceneParams['2_weights']);
+                    }
+                    else{
+                        weightsTexZero = createNetworkWeightTexture(null);
+                        weightsTexOne = createNetworkWeightTexture(null);
+                        weightsTexTwo = createNetworkWeightTexture(null);
+                    }
+                    resolve();
+                });
+
+                let allTexturesPromise = Promise.all([rgbVolumeTexturePromise, featureVolumeTexturePromise, weightTexturePromise]);
+                allTexturesPromise.catch(errors => {
+                    console.error(
+                        'Could not load scene from: ' + gSceneParams['dirUrl'] +
+                        ', errors:\n\t' + errors[0] + '\n\t' + errors[1] + '\n\t' + errors[2] +
+                        '\n\t' + errors[3]);
+                });
+                allTexturesPromise.then(texture => { 
+                    console.log('Successfully loaded scene from: ' + gSceneParams['dirUrl']);
+                    // build mip maps for alpha to enable accelerated ray marching inside each macroblock.
+                    let oldTexture = gl.getParameter(gl.TEXTURE_BINDING_3D);
+                    gl.bindTexture(gl.TEXTURE_3D, alphaVolumeTexture);
+                    gl.generateMipmap(gl.TEXTURE_3D);
+                    gl.bindTexture(gl.TEXTURE_3D, oldTexture);
+
+                    // After all the textures have been loaded, start rendering.
+                    initShaders();
+                    gl.useProgram(shaderProgram);
+                    // load plane object
+                    loadPlane(1280, 720);
+                    
+                    // camera see the plane
+                    mat4.ortho(-640.0, 640.0, 360.0, -360.0, -10000, 10000, pMatrix);
+                    mat4.lookAt([0, 0, 100], [0, 0, 0], [0, 1, 0], vMatrix);
+
+                    // camera to the object
+                    mat4.perspective(35, canvas.offsetWidth / canvas.offsetHeight, 0.33, 100.0, gCamera_Inv_projectionMatrix);
+                    mat4.inverse(gCamera_Inv_projectionMatrix, gCamera_Inv_projectionMatrix);
+
+                    if (gSceneParams['ndc']){
+                        camz = -0.25;
+                    }
+                    else{
+                        camz = -4;
+                    }
+                    pass_constant_uniform();
+
+                    gl.viewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+                    
+                    handlekey(); 
+                    handlemouse();
+                    tick();
+
+                });
+            });
+            initializedPromise.catch(errors => {
+                console.error('Could not load scene from: ' + dirUrl + ', errors:\n\t' + errors[0] +
+                                '\n\t' + errors[1] + '\n\t' + errors[2] + '\n\t' + errors[3]);
+            });
+        }
+        function pass_constant_uniform(){
+            gl.uniformMatrix4fv(shaderProgram.vMatrixUniform, false, vMatrix);
+            gl.uniformMatrix4fv(shaderProgram.pMatrixUniform, false, pMatrix);
+            gl.uniform1i(shaderProgram.ndcUniform, gSceneParams['ndc']);
+            gl.uniform3fv(shaderProgram.minPositionUniform, [gSceneParams['min_x'], gSceneParams['min_y'], gSceneParams['min_z']]);
+            gl.uniform3fv(shaderProgram.gridSizeUniform, [gSceneParams['grid_width'], gSceneParams['grid_height'], gSceneParams['grid_depth']]);
+            gl.uniform3fv(shaderProgram.atlasSizeUniform, [gSceneParams['atlas_width'], gSceneParams['atlas_height'], gSceneParams['atlas_depth']]);
+            gl.uniform1f (shaderProgram.voxelSizeUniform, gSceneParams['voxel_size']);
+            gl.uniform1f (shaderProgram.blockSizeUniform, gSceneParams['block_size']);
+            let M_dict = gSceneParams['worldspace_T_opengl'];
+            worldspace_R_opengl = [
+                M_dict[0][0], M_dict[0][1], M_dict[0][2],
+                M_dict[1][0], M_dict[1][1], M_dict[1][2],
+                M_dict[2][0], M_dict[2][1], M_dict[2][2]];
+            gl.uniformMatrix3fv(shaderProgram.bworldspace_R_openglUniform, false, worldspace_R_opengl);
+            gl.uniform1f (shaderProgram.nearPlaneUniform, 0.33);
+            let ndc_f = 755.644059435;
+            let ndc_w = 1006.0;
+            let ndc_h = 756.0;
+            if ("input_focal" in gSceneParams) {
+                ndc_f = parseFloat(gSceneParams['input_focal']);
+                ndc_w = parseFloat(gSceneParams['input_width']);
+                ndc_h = parseFloat(gSceneParams['input_height']);
+            }
+            gl.uniform1f (shaderProgram.ndc_fUniform, ndc_f);
+            gl.uniform1f (shaderProgram.ndc_wUniform, ndc_w);
+            gl.uniform1f (shaderProgram.ndc_hUniform, ndc_h);     
+        }
+
+        function handlekey(){
+            document.body.onkeyup = function(e) {
+                if (e.key == " " || e.code == "Space" || e.keyCode == 32) {
+                    if (DisplayMode == 0) {DisplayMode = 1;} 
+                    else if (DisplayMode == 1) {DisplayMode = 2;} 
+                    else if (DisplayMode == 2) {DisplayMode = 3;} 
+                    else if (DisplayMode == 3) {DisplayMode = 4;} 
+                    else if (DisplayMode == 4) {DisplayMode = 5;} 
+                    else if (DisplayMode == 5) {DisplayMode = 0;} 
+                }
+            }
+        }
+        function handlemouse(){
+            let canvasIsPressed = false
+            let lastPressX
+            let lastPressY
+            canvas.onmousedown = function (e) {
+                canvasIsPressed = true;
+                lastPressX = e.pageX;
+                lastPressY = e.pageY;
+            }
+            canvas.onmouseup = function () {
+                canvasIsPressed = false;
+            }
+            canvas.onmouseout = function () {
+                canvasIsPressed = false;
+            }
+            canvas.onmousemove = function (e) {
+                if (canvasIsPressed) {
+                  xRotation -= (e.pageY - lastPressY) / 50;
+                  yRotation -= (e.pageX - lastPressX) / 50;
+                  xRotation = Math.min(xRotation, Math.PI / 2.);
+                  xRotation = Math.max(xRotation, -Math.PI / 2.);
+                  lastPressX = e.pageX;
+                  lastPressY = e.pageY;
+                }
+            }
+            canvas.onmousewheel = function (e){
+                let mousex = e.clientX - canvas.offsetLeft;
+                let mousey = e.clientY - canvas.offsetTop;
+                if(gSceneParams['ndc']){
+                    let wheel = e.wheelDelta/9600;
+                    camz += wheel;
+                    camz = Math.min(camz, -0.05);
+                    camz = Math.max(camz, -0.625);           
+                }
+                else{
+                    let wheel = e.wheelDelta/600;
+                    camz += wheel;
+                    camz = Math.min(camz, -1);
+                    camz = Math.max(camz, -10);    
+                }
+            }
+
+            canvas.addEventListener('touchstart', function (e) {
+                lastPressX = e.touches[0].clientX;
+                lastPressY = e.touches[0].clientY;
+            })
+
+            canvas.addEventListener('touchmove', function (e) {
+                e.preventDefault();
+                xRotation -= (e.touches[0].clientY - lastPressY) / 50;
+                yRotation -= (e.touches[0].clientX - lastPressX) / 50;
+                xRotation = Math.min(xRotation, Math.PI / 2.);
+                xRotation = Math.max(xRotation, -Math.PI / 2.);
+                lastPressX = e.touches[0].clientX;
+                lastPressY = e.touches[0].clientY;
+            })
+        }
+
+        function loadPlane(width, height) {
+            const halfWidth = width / 2;
+            const halfHeight = height / 2;
+
+            const PlaneVertices = new Float32Array([
+                -halfWidth, -halfHeight, -100,
+                halfWidth, -halfHeight, -100,
+                -halfWidth, halfHeight, -100,
+                halfWidth, halfHeight, -100,
+            ]);
+            const PlaneIndices = [0, 1, 2, 2, 1, 3];
+
+            VertexPositionBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, VertexPositionBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(PlaneVertices), gl.STATIC_DRAW);
+
+            VertexIndiceBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, VertexIndiceBuffer);
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(PlaneIndices), gl.STATIC_DRAW);
+            VertexIndiceBuffer.numItems = PlaneIndices.length;
+        }
+
+        function drawScene() {
+            gl.clearColor(0, 0, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+            gl.enableVertexAttribArray(shaderProgram.vertexPositionAttribute);
+            gl.bindBuffer(gl.ARRAY_BUFFER, VertexPositionBuffer);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, VertexIndiceBuffer);
+            gl.vertexAttribPointer(shaderProgram.vertexPositionAttribute, 3, gl.FLOAT, gl.FALSE, 3 * 4, 0 * 4);
+            
+       
+            mat4.lookAt([0.0, 0.0, camz], [0, 0, 0], [0, 1, 0], gCamera_Inv_matrixWorld);
+            mat4.rotate(gCamera_Inv_matrixWorld,  xRotation, [1, 0, 0]); 
+            mat4.rotate(gCamera_Inv_matrixWorld,  yRotation, [0, 1, 0]);
+            mat4.inverse(gCamera_Inv_matrixWorld, gCamera_Inv_matrixWorld);
+            mat4.multiply(gCamera_Inv_matrixWorld, gCamera_Inv_projectionMatrix, world_T_clip);
+            gl.uniformMatrix4fv(shaderProgram.world_T_clipUniform, false, world_T_clip);            
+
+
+            gl.uniform1i(shaderProgram.displayModeUniform, DisplayMode);
+            
+            gl.activeTexture(gl.TEXTURE0)
+            gl.bindTexture(gl.TEXTURE_3D, alphaVolumeTexture);
+            gl.activeTexture(gl.TEXTURE1)
+            gl.bindTexture(gl.TEXTURE_3D, rgbVolumeTexture);
+            gl.activeTexture(gl.TEXTURE2)
+            gl.bindTexture(gl.TEXTURE_3D, featureVolumeTexture);
+            gl.activeTexture(gl.TEXTURE3)
+            gl.bindTexture(gl.TEXTURE_3D, atlasIndexTexture);
+		    
+            gl.activeTexture(gl.TEXTURE4);
+            gl.bindTexture(gl.TEXTURE_2D, weightsZero);
+            gl.activeTexture(gl.TEXTURE5);
+            gl.bindTexture(gl.TEXTURE_2D, weightsOne);
+            gl.activeTexture(gl.TEXTURE6);
+            gl.bindTexture(gl.TEXTURE_2D, weightsTwo);
+
+            gl.drawElements(gl.TRIANGLES, VertexIndiceBuffer.numItems, gl.UNSIGNED_SHORT, 0);
+
+        }
+
+        function tick() {
+            requestAnimFrame(tick);
+            drawScene();
+        }
+
+        function webGLStart() {
+            let sceneDir = './models/lego'
+            loadScene(sceneDir)
+        }
+    </script>
+</head>
+
+<style>
+    #canvasContainer {
+      text-align: center;
+    }
+    #ICG-canvas {
+      border: 2px solid black;
+    }
+</style>
+
+<body onload="webGLStart();">
+    <div id="canvasContainer">
+        <canvas id="ICG-canvas" width="1280" height="720"></canvas>
+    </div>
+</body>
+
+</html>
